@@ -1,0 +1,276 @@
+Index: libavfilter/af_dumpwave.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- libavfilter/af_dumpwave.c	(date 1549107566000)
++++ libavfilter/af_dumpwave.c	(date 1549107566000)
+@@ -0,0 +1,238 @@
++/*
++ * Copyright (c) 2019 Dmytro Humeniuk
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * waveform audio filter – dump RMS amplitude to a file
++ */
++
++#include "libavutil/avassert.h"
++#include "libavutil/avstring.h"
++#include "libavutil/channel_layout.h"
++#include "libavutil/opt.h"
++#include "libavutil/parseutils.h"
++#include "avfilter.h"
++#include "formats.h"
++#include "audio.h"
++#include "internal.h"
++
++typedef struct DumpWaveContext {
++    const AVClass *class;   /**< class for AVOptions */
++    int width;              /**< number of data values */
++    int height;             /**< scale to height */
++    int idx;                /**< index of current value */
++    char *filename;         /**< output filename */
++    float *values;          /**< scaling factors */
++    int64_t nb_samples;     /**< samples per value per channel */
++    int64_t count;          /**< current number of samples counted */
++    int64_t frame_size;     /**< samples per value */
++    double sum;             /**< sum of the squared samples per value */
++    double max_value;       /**< keep track of max value */
++    FILE *dump_fp;
++} DumpWaveContext;
++
++#define OFFSET(x) offsetof(DumpWaveContext, x)
++#define FLAGS AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
++
++static const AVOption dumpwave_options[] = {
++    { "w", "set number of data values",  OFFSET(width), AV_OPT_TYPE_INT,  {.i64 = 1800}, 1, INT_MAX, FLAGS },
++    { "width", "set number of data values",  OFFSET(width), AV_OPT_TYPE_INT,  {.i64 = 1800}, 1, INT_MAX, FLAGS },
++    { "h", "set height to scale values",  OFFSET(height), AV_OPT_TYPE_INT,  {.i64 = 140}, 1, INT_MAX, FLAGS },
++    { "height", "set height to scale values",  OFFSET(height), AV_OPT_TYPE_INT,  {.i64 = 140}, 1, INT_MAX, FLAGS },
++    { "n", "set number of samples per value per channel",  OFFSET(nb_samples), AV_OPT_TYPE_INT64,  {.i64 = 128}, 1, INT64_MAX, FLAGS },
++    { "nb_samples", "set number of samples per value per channel",  OFFSET(nb_samples), AV_OPT_TYPE_INT64,  {.i64 = 128}, 1, INT64_MAX, FLAGS },
++    { "f", "set dump file", OFFSET(filename), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS },
++    { "file", "set dump file", OFFSET(filename), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(dumpwave);
++
++static av_cold int init(AVFilterContext *ctx)
++{
++    DumpWaveContext *dumpwave = ctx->priv;
++
++    dumpwave->sum = dumpwave->idx = dumpwave->count = 0;
++
++    if (!dumpwave->filename) {
++        av_log(ctx, AV_LOG_ERROR, "No output file provided\n");
++        return AVERROR(EINVAL);
++    } else if (!strcmp("-", dumpwave->filename)) {
++        dumpwave->dump_fp = stdout;
++    } else {
++        dumpwave->dump_fp = fopen(dumpwave->filename, "w");
++        if (!dumpwave->dump_fp) {
++            int err = AVERROR(errno);
++            char buf[128];
++            av_strerror(err, buf, sizeof(buf));
++            av_log(ctx, AV_LOG_ERROR, "Could not open file %s: %s\n",
++                   dumpwave->filename, buf);
++            return err;
++        }
++        fprintf(dumpwave->dump_fp, "{\"width\":%d,\"height\":%d,\"samples\":[", dumpwave->width, dumpwave->height);
++    }
++    return 0;
++}
++
++static av_cold void uninit(AVFilterContext *ctx)
++{
++    DumpWaveContext *dumpwave = ctx->priv;
++    fclose(dumpwave->dump_fp);
++    av_freep(&dumpwave->values);
++}
++
++static int query_formats(AVFilterContext *ctx)
++{
++    static const enum AVSampleFormat sample_fmts[] = {
++        AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP,
++        AV_SAMPLE_FMT_NONE
++    };
++    AVFilterFormats *formats;
++    AVFilterChannelLayouts *layouts;
++    int ret;
++
++    if (!(formats = ff_make_format_list(sample_fmts)))
++        return AVERROR(ENOMEM);
++
++    layouts = ff_all_channel_counts();
++    if (!layouts)
++        return AVERROR(ENOMEM);
++    ret = ff_set_common_channel_layouts(ctx, layouts);
++    if (ret < 0)
++        return ret;
++
++    return ff_set_common_formats(ctx, formats);
++}
++
++static int config_input(AVFilterLink *inlink)
++{
++    DumpWaveContext *dumpwave = inlink->dst->priv;
++    dumpwave->frame_size = dumpwave->nb_samples * inlink->channels;
++
++    return 0;
++}
++
++static int config_output(AVFilterLink *outlink)
++{
++    AVFilterContext *ctx = outlink->src;
++    DumpWaveContext *dumpwave = ctx->priv;
++    dumpwave->values = av_malloc(dumpwave->width * sizeof(float));
++    if (!dumpwave->values)
++        return AVERROR(ENOMEM);
++    memset(dumpwave->values, 0, dumpwave->width * sizeof(float));
++
++    return 0;
++}
++
++static int request_frame(AVFilterLink *outlink) {
++    AVFilterContext *ctx = outlink->src;
++    DumpWaveContext *dumpwave = ctx->priv;
++
++    AVFilterLink *inlink = ctx->inputs[0];
++
++    int ret = ff_request_frame(inlink);
++
++    if (ret == AVERROR_EOF)
++        for (int i = 0; i < dumpwave->width; i++)
++            fprintf(dumpwave->dump_fp, (i == dumpwave->width - 1) ? "%d]}\n" : "%d,",
++                    av_clip(dumpwave->values[i] / dumpwave->max_value * dumpwave->height, 0, dumpwave->height));
++    return ret;
++}
++
++/**
++ * Convert sample to dB and calculate root mean squared value
++ */
++static inline void RMS(DumpWaveContext *dumpwave, const float sample)
++{
++    double value = 0.;
++    if (sample != 0)
++        value = (20. * log10(fabs(sample)) + 60.) / 60.;
++
++    dumpwave->sum += value * value;
++
++    if (dumpwave->count++ == dumpwave->frame_size) {
++        value = av_clipd(sqrt(dumpwave->sum / dumpwave->frame_size), 0, 1.0);
++        dumpwave->max_value = FFMAX(value, dumpwave->max_value);
++        dumpwave->values[dumpwave->idx++] = value;
++        dumpwave->sum = dumpwave->count = 0;
++    }
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
++{
++    AVFilterContext *ctx = inlink->dst;
++    DumpWaveContext *dumpwave = ctx->priv;
++    int channels = frame->channels;
++    int c, i;
++
++    if (dumpwave->idx < dumpwave->width)
++        switch (inlink->format) {
++            case AV_SAMPLE_FMT_FLTP:
++                for (c = 0; c < channels; c++) {
++                    const float *src = (const float *)frame->extended_data[c];
++
++                    for (i = 0; i < frame->nb_samples; i++, src++)
++                        RMS(dumpwave, *src);
++                }
++                break;
++            case AV_SAMPLE_FMT_FLT: {
++                const float *src = (const float *)frame->extended_data[0];
++
++                for (i = 0; i < frame->nb_samples; i++) {
++                    for (c = 0; c < channels; c++, src++)
++                        RMS(dumpwave, *src);
++                }
++
++            } break;
++        }
++    return ff_filter_frame(inlink->dst->outputs[0], frame);
++}
++
++static const AVFilterPad dumpwave_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_AUDIO,
++        .filter_frame = filter_frame,
++        .config_props  = config_input
++    },
++    { NULL }
++};
++
++static const AVFilterPad dumpwave_outputs[] = {
++    {
++        .name          = "default",
++        .type          = AVMEDIA_TYPE_AUDIO,
++        .request_frame = request_frame,
++        .config_props  = config_output
++    },
++    { NULL }
++};
++
++AVFilter ff_af_dumpwave = {
++    .name          = "dumpwave",
++    .description   = NULL_IF_CONFIG_SMALL("Dump RMS amplitude to a file"),
++    .init          = init,
++    .uninit        = uninit,
++    .query_formats = query_formats,
++    .priv_size     = sizeof(DumpWaveContext),
++    .inputs        = dumpwave_inputs,
++    .outputs       = dumpwave_outputs,
++    .priv_class    = &dumpwave_class,
++};
+Index: libavfilter/Makefile
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- libavfilter/Makefile	(revision 6dc06e979c3867d5805d4e7418d86e25bdd4809f)
++++ libavfilter/Makefile	(date 1549103034000)
+@@ -100,6 +100,7 @@
+ OBJS-$(CONFIG_CRYSTALIZER_FILTER)            += af_crystalizer.o
+ OBJS-$(CONFIG_DCSHIFT_FILTER)                += af_dcshift.o
+ OBJS-$(CONFIG_DRMETER_FILTER)                += af_drmeter.o
++OBJS-$(CONFIG_DUMPWAVE_FILTER)               += af_dumpwave.o
+ OBJS-$(CONFIG_DYNAUDNORM_FILTER)             += af_dynaudnorm.o
+ OBJS-$(CONFIG_EARWAX_FILTER)                 += af_earwax.o
+ OBJS-$(CONFIG_EBUR128_FILTER)                += f_ebur128.o
+Index: libavfilter/allfilters.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+--- libavfilter/allfilters.c	(revision 6dc06e979c3867d5805d4e7418d86e25bdd4809f)
++++ libavfilter/allfilters.c	(date 1549103034000)
+@@ -92,6 +92,7 @@
+ extern AVFilter ff_af_crystalizer;
+ extern AVFilter ff_af_dcshift;
+ extern AVFilter ff_af_drmeter;
++extern AVFilter ff_af_dumpwave;
+ extern AVFilter ff_af_dynaudnorm;
+ extern AVFilter ff_af_earwax;
+ extern AVFilter ff_af_ebur128;
