@@ -102,7 +102,7 @@ class WfThread(object):
             '-i', WORK_DIR + self.__key,
             '-map', '0:0',
             '-progress', '/dev/stderr',
-            '-af', 'dumpwave=s=%dx%d:c=%d:json=%s' % (WIDTH, HEIGHT, spl, WORK_DIR + self.__mJsonFile),
+            '-af', 'dumpwave=w=%d:h=%d:n=%d:f=%s' % (WIDTH, HEIGHT, spl, WORK_DIR + self.__mJsonFile),
             WORK_DIR + self.__outFile
         ], stdout=PIPE, stderr=PIPE, bufsize=1)
 
