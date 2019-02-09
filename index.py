@@ -43,7 +43,8 @@ class WfThread(object):
     @property
     def SQSQueue(self):
         if None == self.__SQSQueue:
-            self.__SQSQueue = sqs.create_queue(QueueName=self.__key)
+            self.__SQSQueue = sqs.create_queue(QueueName=self.__key+'.fifo',
+                                               Attributes={'FifoQueue': 'true', 'ContentBasedDeduplication':'true'})
         return self.__SQSQueue
 
     @property
@@ -139,7 +140,7 @@ class WfThread(object):
         now = datetime.now()
         if force or now - self.__ts > delta:
             self.__ts = now
-            self.SQSQueue.send_message(MessageBody=msg)
+            self.SQSQueue.send_message(MessageBody=msg, MessageGroupId=self.__key)
 
     def __download(self):
         try:
