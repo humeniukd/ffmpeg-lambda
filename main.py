@@ -1,4 +1,4 @@
-import boto3
+from google.cloud import storage, pubsub_v1
 from subprocess import Popen, PIPE
 from datetime import datetime, timedelta
 from re import U, I, compile as recompile
@@ -6,13 +6,15 @@ from os import remove, environ
 from math import floor
 import csv, json
 
-s3 = boto3.resource('s3')
-sqs = boto3.resource('sqs')
+s3 = storage.Client()
+publisher = pubsub_v1.PublisherClient()
 
+LOCATION_ID = '' #TODO
+PROJECT_ID = '' #TODO
 HEIGHT = 140
 WIDTH = 1800
 
-OUT_BUCKET_NAME = environ['OUT_BUCKET_NAME']
+OUT_BUCKET_NAME = environ['BUCKET']
 
 WORK_DIR = environ.get('WORK_DIR', '/tmp/')
 
@@ -22,7 +24,6 @@ re_position = recompile('out_time_ms=(\d+)\d{3}', U)
 
 delta = timedelta(seconds=2)
 
-
 def time2ms(s):
     hours = 3600000 * int(s.group(1))
     minutes = 60000 * int(s.group(2))
@@ -30,13 +31,11 @@ def time2ms(s):
     ms = 10 * int(s.group(4))
     return hours + minutes + seconds + ms
 
-
 def ratio(position, duration):
     if not position or not duration:
         return 0
     percent = int(floor(100 * position / duration))
     return 100 if percent > 100 else percent
-
 
 class WfThread(object):
     global WORK_DIR, WIDTH, HEIGHT
@@ -46,8 +45,7 @@ class WfThread(object):
     @property
     def SQSQueue(self):
         if None == self.__SQSQueue:
-            self.__SQSQueue = sqs.create_queue(QueueName=self.__key + '.fifo',
-                                               Attributes={'FifoQueue': 'true', 'ContentBasedDeduplication': 'true'})
+            pass
         return self.__SQSQueue
 
     def __init__(self, key=None, bucket=None):
@@ -55,17 +53,20 @@ class WfThread(object):
         self.__outFile = key + '.mp3'
         self.__csvFile = key + '.csv'
         self.__jsonFile = key + '.json'
-        self.__inBucket = s3.Bucket(bucket)
+        self.__inBucket = s3.bucket(bucket)
+        self.__topic = publisher.topic_path(PROJECT_ID, self.__key)
+        publisher.create_topic(name=self.__topic)
         self.__ts = datetime.now()
 
     def __del__(self):
         for fileName in [self.__csvFile, self.__key, self.__outFile]:
             remove(WORK_DIR + fileName)
-        self.__inBucket.delete_objects(Delete={'Objects': [{'Key': self.__key}]})
+        blob = self.__inBucket.blob(self.__key)
+        blob.delete()
         print('Destruct %s', self.__key)
 
     def run(self):
-        for fn in [ self.__download, self.__probe, self.__process, self.__convert, self.__upload]:
+        for fn in [self.__download, self.__probe, self.__process, self.__convert, self.__upload]:
             if not fn():
                 self.__enqueue('{"key": "error"}')
                 break
@@ -139,11 +140,14 @@ class WfThread(object):
         now = datetime.now()
         if force or now - self.__ts > delta:
             self.__ts = now
-            self.SQSQueue.send_message(MessageBody=msg, MessageGroupId=self.__key)
+            response = publisher.publish(self.__topic, msg)
+            pass
 
     def __download(self):
         try:
-            self.__inBucket.download_file(self.__key, WORK_DIR + self.__key)
+            blob = self.__inBucket.blob(self.__key)
+            blob.download_to_filename(WORK_DIR + self.__key)
+
         except Exception as e:
             print('Download failed %s', str(e))
             return False
@@ -156,7 +160,7 @@ class WfThread(object):
             with open(WORK_DIR + self.__csvFile) as csvFile:
                 csvReader = csv.DictReader(csvFile)
                 for v in csvReader.fieldnames:
-                    data.append(int(float(v)*HEIGHT))
+                    data.append(int(float(v) * HEIGHT))
             with open(WORK_DIR + self.__jsonFile, 'w') as jsonFile:
                 jsonFile.write(json.dumps({
                     'width': WIDTH,
@@ -171,12 +175,11 @@ class WfThread(object):
 
     def __upload(self):
         global WORK_DIR, OUT_BUCKET_NAME
-        bucket = s3.Bucket(OUT_BUCKET_NAME)
+        bucket = s3.bucket(OUT_BUCKET_NAME)
         for fileName in [self.__jsonFile, self.__outFile]:
             try:
-                data = open(WORK_DIR + fileName, 'rb')
-                bucket.put_object(Key=fileName, Body=data, ACL='public-read',
-                                  Metadata={'duration': str(self.__duration)})
+                blob = bucket.blob(fileName)
+                blob.upload_from_filename(WORK_DIR + fileName)
             except Exception as e:
                 print('Upload failed: %s', str(e))
                 return False
@@ -185,8 +188,7 @@ class WfThread(object):
 
 
 def handler(event, context):
-    key = event['Records'][0]['s3']['object']['key']
-    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = event['name']
+    bucket = event['bucket']
     WfThread(key, bucket).run()
     return 'ok'
-
