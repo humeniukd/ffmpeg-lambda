@@ -4,15 +4,18 @@ from datetime import datetime, timedelta
 from re import U, I, compile as recompile
 from os import remove, environ
 from math import floor
-import csv, json
+import csv
+import json
+import elasticache_auto_discovery
+from pymemcache.client.hash import HashClient
 
 s3 = boto3.resource('s3')
-sqs = boto3.resource('sqs')
 
 HEIGHT = 140
 WIDTH = 1800
 
-OUT_BUCKET_NAME = environ['OUT_BUCKET_NAME']
+OUT_BUCKET_NAME = environ['BUCKET']
+EC_ENDPOINT = environ['EC_ENDPOINT']
 
 WORK_DIR = environ.get('WORK_DIR', '/tmp/')
 
@@ -22,6 +25,9 @@ re_position = recompile('out_time_ms=(\d+)\d{3}', U)
 
 delta = timedelta(seconds=2)
 
+nodes = elasticache_auto_discovery.discover(EC_ENDPOINT)
+nodes = map(lambda x: (x[1], int(x[2])), nodes)
+memcache_client = HashClient(nodes)
 
 def time2ms(s):
     hours = 3600000 * int(s.group(1))
@@ -30,25 +36,15 @@ def time2ms(s):
     ms = 10 * int(s.group(4))
     return hours + minutes + seconds + ms
 
-
 def ratio(position, duration):
     if not position or not duration:
         return 0
     percent = int(floor(100 * position / duration))
     return 100 if percent > 100 else percent
 
-
 class WfThread(object):
     global WORK_DIR, WIDTH, HEIGHT
-    __SQSQueue = None
     __inBucket = None
-
-    @property
-    def SQSQueue(self):
-        if None == self.__SQSQueue:
-            self.__SQSQueue = sqs.create_queue(QueueName=self.__key + '.fifo',
-                                               Attributes={'FifoQueue': 'true', 'ContentBasedDeduplication': 'true'})
-        return self.__SQSQueue
 
     def __init__(self, key=None, bucket=None):
         self.__key = key
@@ -139,7 +135,7 @@ class WfThread(object):
         now = datetime.now()
         if force or now - self.__ts > delta:
             self.__ts = now
-            self.SQSQueue.send_message(MessageBody=msg, MessageGroupId=self.__key)
+            memcache_client.set(self.__key, msg)
 
     def __download(self):
         try:
@@ -182,7 +178,6 @@ class WfThread(object):
                 return False
             print('Uploaded %s', fileName)
         return True
-
 
 def handler(event, context):
     key = event['Records'][0]['s3']['object']['key']
