@@ -12,7 +12,7 @@ sqs = boto3.resource('sqs')
 HEIGHT = 140
 WIDTH = 1800
 
-OUT_BUCKET_NAME = environ['OUT_BUCKET_NAME']
+OUT_BUCKET_NAME = environ['BUCKET']
 
 WORK_DIR = environ.get('WORK_DIR', '/tmp/')
 
@@ -20,7 +20,7 @@ re_duration = recompile('Duration: (\d{2}):(\d{2}):(\d{2}).(\d{2})[^\d]*', U)
 re_freq = recompile('(\d+) Hz', U | I)
 re_position = recompile('out_time_ms=(\d+)\d{3}', U)
 
-delta = timedelta(seconds=2)
+delta = timedelta(seconds=1)
 
 
 def time2ms(s):
@@ -51,6 +51,7 @@ class WfThread(object):
         return self.__SQSQueue
 
     def __init__(self, key=None, bucket=None):
+        self.__duration = None
         self.__key = key
         self.__outFile = key + '.mp3'
         self.__csvFile = key + '.csv'
@@ -60,14 +61,17 @@ class WfThread(object):
 
     def __del__(self):
         for fileName in [self.__csvFile, self.__key, self.__outFile]:
-            remove(WORK_DIR + fileName)
+            try:
+                remove(WORK_DIR + fileName)
+            except FileNotFoundError:
+                pass
         self.__inBucket.delete_objects(Delete={'Objects': [{'Key': self.__key}]})
         print('Destruct %s', self.__key)
 
     def run(self):
-        for fn in [ self.__download, self.__probe, self.__process, self.__convert, self.__upload]:
+        for fn in [ self.__download, self.__probe, self.__process, self.__convert, self.__upload, self.__finally]:
             if not fn():
-                self.__enqueue('{"key": "error"}')
+                self.__enqueue('{"key": "error"}', True)
                 break
 
     def __probe(self):
@@ -90,7 +94,8 @@ class WfThread(object):
             duration_match = re_duration.search(output)
             if duration_match:
                 self.__duration = time2ms(duration_match)
-
+        if not self.__duration:
+            return False
         print('probe RC: %d', rc)
         return 0 == rc
 
@@ -141,6 +146,13 @@ class WfThread(object):
             self.__ts = now
             self.SQSQueue.send_message(MessageBody=msg, MessageGroupId=self.__key)
 
+    def __finally(self):
+        queue = sqs.get_queue_by_name(QueueName='transcodings.fifo')
+        queue.send_message(
+            MessageBody='{"key": "%(key)s", "duration": %(duration)d}' % {'key': self.__key, 'duration': self.__duration},
+            MessageGroupId=self.__key)
+        return True
+
     def __download(self):
         try:
             self.__inBucket.download_file(self.__key, WORK_DIR + self.__key)
@@ -175,8 +187,7 @@ class WfThread(object):
         for fileName in [self.__jsonFile, self.__outFile]:
             try:
                 data = open(WORK_DIR + fileName, 'rb')
-                bucket.put_object(Key=fileName, Body=data, ACL='public-read',
-                                  Metadata={'duration': str(self.__duration)})
+                bucket.put_object(Key=fileName, Body=data, ACL='public-read')
             except Exception as e:
                 print('Upload failed: %s', str(e))
                 return False
@@ -189,4 +200,3 @@ def handler(event, context):
     bucket = event['Records'][0]['s3']['bucket']['name']
     WfThread(key, bucket).run()
     return 'ok'
-
