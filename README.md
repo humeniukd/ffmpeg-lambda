@@ -1,6 +1,7 @@
-# wf-lambda
-Static FFmpeg Build for AWS Lambda runtime https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html
-AWS Lambda python FFmpeg wrapper to work with S3 and SQS
-Custom FFmpeg release optimized for Amazon Linux AMI amzn-ami-hvm-2018.03.0.20181129-x86_64-gp2
-Just set index.py#handler() as S3 'Put' Event notification handler
-
+# FFmpeg-lambda
+Static FFmpeg built with [dumpwave filter patch](https://patchwork.ffmpeg.org/project/ffmpeg/patch/20190107143115.101095-1-dhumeniuk@google.com)  
+Purpose: Transcode audio, calculate RMS amplitude envelope in json format [example usage](https://git.io/JkgX8)  
+![RMS amplitude envelope example](./example.png "RMS amplitude envelope example 1")
+Python wrapper - Fetches audio file, transcode (sending progress to queue/pubsub), upload results to separate bucket  
+AWS: Just set index.py#handler() as S3 'Put' Event notification handler  
+GCP `git checkout gcp`: Simply set main.py#handler() as Storage 'Create/Finalize' Event notification handler
