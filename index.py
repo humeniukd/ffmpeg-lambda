@@ -55,8 +55,8 @@ class WfThread(object):
         self.__duration = None
         self.__key = key
         self.__inFile = key + 'i'
-        self.__csvFile = key + '.csv'
-        self.__jsonFile = key + '.json'
+        self.__csvFile = 'samples.csv'
+        self.__jsonFile = 'waveform.json'
         self.__inBucket = s3.Bucket(bucket)
         self.__ts = datetime.now()
         mkdir(WORK_DIR + key)
@@ -113,12 +113,12 @@ class WfThread(object):
             './ffmpeg',
             '-i', WORK_DIR + self.__inFile,
             '-map', '0:0',
-            '-f', 'segment',
-            '-segment_time', '6',
-            '-segment_list', '%splaylist.m3u8' % (self.__workDir),
+            '-hls_time', '8',
+            '-hls_list_size', '0',
+            '-hls_segment_filename', '%(wd)sseg%%d.ts' % {'wd': self.__workDir},
             '-progress', '/dev/stderr',
             '-af', 'dumpwave=w=%d:n=%d:f=%s' % (WIDTH, spl, self.__workDir + self.__csvFile),
-            '%(wd)sfile%%d.m4a' % {'wd': self.__workDir}
+            '%(wd)splaylist.m3u8' % {'wd': self.__workDir},
         ], stdout=PIPE, stderr=PIPE, bufsize=1)
 
         ms = None
