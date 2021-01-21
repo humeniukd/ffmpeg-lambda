@@ -1,10 +1,11 @@
-import boto3
 from subprocess import Popen, PIPE
 from datetime import datetime, timedelta
 from re import U, I, compile as recompile
-from os import remove, environ
+from os import mkdir, remove, walk, environ
 from math import floor
 import csv, json
+from shutil import rmtree
+import boto3
 
 s3 = boto3.resource('s3')
 sqs = boto3.resource('sqs')
@@ -20,7 +21,7 @@ re_duration = recompile('Duration: (\d{2}):(\d{2}):(\d{2}).(\d{2})[^\d]*', U)
 re_freq = recompile('(\d+) Hz', U | I)
 re_position = recompile('out_time_ms=(\d+)\d{3}', U)
 
-delta = timedelta(seconds=1)
+delta = timedelta(seconds=2)
 
 
 def time2ms(s):
@@ -53,23 +54,29 @@ class WfThread(object):
     def __init__(self, key=None, bucket=None):
         self.__duration = None
         self.__key = key
-        self.__outFile = key + '.mp3'
+        self.__inFile = key + 'i'
         self.__csvFile = key + '.csv'
         self.__jsonFile = key + '.json'
         self.__inBucket = s3.Bucket(bucket)
         self.__ts = datetime.now()
+        mkdir(WORK_DIR + key)
+        self.__workDir = '%s%s/' % (WORK_DIR, key)
 
     def __del__(self):
-        for fileName in [self.__csvFile, self.__key, self.__outFile]:
-            try:
-                remove(WORK_DIR + fileName)
-            except FileNotFoundError:
-                pass
+        remove(WORK_DIR + self.__inFile)
+        rmtree(self.__workDir)
         self.__inBucket.delete_objects(Delete={'Objects': [{'Key': self.__key}]})
         print('Destruct %s', self.__key)
 
     def run(self):
-        for fn in [ self.__download, self.__probe, self.__process, self.__convert, self.__upload, self.__finally]:
+        for fn in [
+            self.__download,
+            self.__probe,
+            self.__process,
+            self.__convert,
+            self.__upload,
+            self.__finally
+        ]:
             if not fn():
                 self.__enqueue('{"key": "error"}', True)
                 break
@@ -77,7 +84,7 @@ class WfThread(object):
     def __probe(self):
         process = Popen([
             './ffprobe',
-            '-i', WORK_DIR + self.__key
+            '-i', WORK_DIR + self.__inFile
         ], stdout=PIPE, stderr=PIPE, bufsize=1)
 
         while True:
@@ -104,11 +111,14 @@ class WfThread(object):
         print('duration: %d, freq: %d, spl: %d', self.__duration, self.__freq, spl)
         process = Popen([
             './ffmpeg',
-            '-i', WORK_DIR + self.__key,
+            '-i', WORK_DIR + self.__inFile,
             '-map', '0:0',
+            '-f', 'segment',
+            '-segment_time', '6',
+            '-segment_list', '%splaylist.m3u8' % (self.__workDir),
             '-progress', '/dev/stderr',
-            '-af', 'dumpwave=w=%d:n=%d:f=%s' % (WIDTH, spl, WORK_DIR + self.__csvFile),
-                  WORK_DIR + self.__outFile
+            '-af', 'dumpwave=w=%d:n=%d:f=%s' % (WIDTH, spl, self.__workDir + self.__csvFile),
+            '%(wd)sfile%%d.m4a' % {'wd': self.__workDir}
         ], stdout=PIPE, stderr=PIPE, bufsize=1)
 
         ms = None
@@ -155,7 +165,7 @@ class WfThread(object):
 
     def __download(self):
         try:
-            self.__inBucket.download_file(self.__key, WORK_DIR + self.__key)
+            self.__inBucket.download_file(self.__key, WORK_DIR + self.__inFile)
         except Exception as e:
             print('Download failed %s', str(e))
             return False
@@ -165,11 +175,11 @@ class WfThread(object):
     def __convert(self):
         try:
             data = []
-            with open(WORK_DIR + self.__csvFile) as csvFile:
+            with open(self.__workDir + self.__csvFile) as csvFile:
                 csvReader = csv.DictReader(csvFile)
                 for v in csvReader.fieldnames:
                     data.append(int(float(v)*HEIGHT))
-            with open(WORK_DIR + self.__jsonFile, 'w') as jsonFile:
+            with open(self.__workDir + self.__jsonFile, 'w') as jsonFile:
                 jsonFile.write(json.dumps({
                     'width': WIDTH,
                     'height': HEIGHT,
@@ -182,16 +192,17 @@ class WfThread(object):
         return True
 
     def __upload(self):
-        global WORK_DIR, OUT_BUCKET_NAME
+        global OUT_BUCKET_NAME
         bucket = s3.Bucket(OUT_BUCKET_NAME)
-        for fileName in [self.__jsonFile, self.__outFile]:
+        for root, dirs, files in walk(self.__workDir):
             try:
-                data = open(WORK_DIR + fileName, 'rb')
-                bucket.put_object(Key=fileName, Body=data, ACL='public-read')
+                for file in files:
+                    data = open(self.__workDir + file, 'rb')
+                    bucket.put_object(Key='%s/%s' % (self.__key, file), Body=data, ACL='public-read')
+                    print('Uploaded %s', file)
             except Exception as e:
                 print('Upload failed: %s', str(e))
                 return False
-            print('Uploaded %s', fileName)
         return True
 
 
