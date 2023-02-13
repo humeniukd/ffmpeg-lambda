@@ -59,7 +59,11 @@ class WfThread(object):
         self.__jsonFile = 'waveform.json'
         self.__inBucket = s3.Bucket(bucket)
         self.__ts = datetime.now()
-        mkdir(WORK_DIR + key)
+        try:
+            mkdir(WORK_DIR + key)
+        except:
+            rmtree(WORK_DIR + key)
+            mkdir(WORK_DIR + key)
         self.__workDir = '%s%s/' % (WORK_DIR, key)
 
     def __del__(self):
@@ -112,12 +116,10 @@ class WfThread(object):
         process = Popen([
             './ffmpeg',
             '-i', WORK_DIR + self.__inFile,
-            '-c:a', 'libmp3lame',
-            '-b:a', '128k',
             '-map', '0:0',
-            '-hls_time', '9',
+            '-hls_time', '8',
             '-hls_list_size', '0',
-            '-hls_segment_filename', '%(wd)sseg%%d.mp3' % {'wd': self.__workDir},
+            '-hls_segment_filename', '%(wd)sseg%%d.ts' % {'wd': self.__workDir},
             '-progress', '/dev/stderr',
             '-af', 'dumpwave=w=%d:n=%d:f=%s' % (WIDTH, spl, self.__workDir + self.__csvFile),
             '%(wd)splaylist.m3u8' % {'wd': self.__workDir},
